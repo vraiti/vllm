@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -3783,12 +3784,21 @@ class GPUModelRunner(
         num_reqs = self.input_batch.num_reqs
         return bool(self.discard_request_mask.np[:num_reqs].all())
 
+    _PROFILE_STEPS = int(os.environ.get("VLLM_OMNI_PROFILE_STEPS", "0"))
+
     @torch.inference_mode()
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
+        _PROFILE_STEPS = self._PROFILE_STEPS
+        if _PROFILE_STEPS:
+            _prof: dict[str, float] = {}
+            self._prof = _prof
+            self._t_exec_start = time.perf_counter()
+            _t0 = self._t_exec_start
+
         if self.execute_model_state is not None:
             raise RuntimeError(
                 "State error: sample_tokens() must be called "
@@ -3830,7 +3840,12 @@ class GPUModelRunner(
             self.synchronize_input_prep(),
         ):
             # Update persistent batch states.
+            if _PROFILE_STEPS:
+                _t0 = time.perf_counter()
             deferred_state_corrections_fn = self._update_states(scheduler_output)
+            if _PROFILE_STEPS:
+                _prof["update_states_ms"] = (time.perf_counter() - _t0) * 1000
+                _t0 = time.perf_counter()
 
             if has_ec_transfer() and not get_ec_transfer().is_consumer:
                 with self.maybe_get_ec_connector_output(
@@ -3872,10 +3887,15 @@ class GPUModelRunner(
             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
 
+            if _PROFILE_STEPS:
+                _t0 = time.perf_counter()
             logits_indices, spec_decode_metadata = self._prepare_inputs(
                 scheduler_output,
                 num_scheduled_tokens_np,
             )
+            if _PROFILE_STEPS:
+                _prof["_prepare_inputs_ms"] = (time.perf_counter() - _t0) * 1000
+                _t0 = time.perf_counter()
 
             cascade_attn_prefix_lens = None
             # Disable cascade attention when using microbatching (DBO)
@@ -3983,6 +4003,8 @@ class GPUModelRunner(
                 ubatch_slices=ubatch_slices_padded,
             )
 
+            if _PROFILE_STEPS:
+                _t0 = time.perf_counter()
             attn_metadata, spec_decode_common_attn_metadata = (
                 self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded,
@@ -3998,6 +4020,9 @@ class GPUModelRunner(
                     slot_mappings=slot_mappings_by_group,
                 )
             )
+            if _PROFILE_STEPS:
+                _prof["attn_metadata_ms"] = (time.perf_counter() - _t0) * 1000
+                _t0 = time.perf_counter()
 
             (
                 input_ids,
@@ -4009,6 +4034,8 @@ class GPUModelRunner(
             ) = self._preprocess(
                 scheduler_output, num_tokens_padded, intermediate_tensors
             )
+            if _PROFILE_STEPS:
+                _prof["_preprocess_ms"] = (time.perf_counter() - _t0) * 1000
 
         # Set cudagraph mode to none if calc_kv_scales is true.
         # KV scales calculation involves dynamic operations that are incompatible
@@ -4048,6 +4075,8 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
+            if _PROFILE_STEPS:
+                _t0 = time.perf_counter()
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,
@@ -4055,6 +4084,9 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+            if _PROFILE_STEPS:
+                _prof["model_forward_ms"] = (time.perf_counter() - _t0) * 1000
+                _t0 = time.perf_counter()
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -4114,6 +4146,9 @@ class GPUModelRunner(
                 )
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
+
+        if _PROFILE_STEPS:
+            _prof["postprocess_ms"] = (time.perf_counter() - _t0) * 1000
 
         self.execute_model_state = ExecuteModelState(
             scheduler_output,
@@ -4180,8 +4215,17 @@ class GPUModelRunner(
                 scheduler_output, grammar_output, self.input_batch, logits
             )
 
+        _PROFILE_STEPS = self._PROFILE_STEPS
+        if _PROFILE_STEPS:
+            _prof = self._prof
+            _t0 = time.perf_counter()
+
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+
+        if _PROFILE_STEPS:
+            _prof["sampling_ms"] = (time.perf_counter() - _t0) * 1000
+            _t0 = time.perf_counter()
 
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
@@ -4292,6 +4336,8 @@ class GPUModelRunner(
                 ).expand(len(self.input_batch.req_ids), self.num_spec_tokens)
                 self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
 
+        if _PROFILE_STEPS:
+            _t0 = time.perf_counter()
         with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
             (
                 num_nans_in_logits,
@@ -4308,6 +4354,9 @@ class GPUModelRunner(
                 hidden_states,
                 scheduler_output.total_num_scheduled_tokens,
             )
+        if _PROFILE_STEPS:
+            _prof["bookkeeping_sync_ms"] = (time.perf_counter() - _t0) * 1000
+            _t0 = time.perf_counter()
 
         if propose_drafts_after_bookkeeping:
             # ngram and other speculative decoding methods use the sampled
@@ -4327,6 +4376,8 @@ class GPUModelRunner(
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
 
+        if _PROFILE_STEPS:
+            _t0 = time.perf_counter()
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             if self.routed_experts_initialized:
                 capturer = RoutedExpertsCapturer.get_instance()
@@ -4347,6 +4398,16 @@ class GPUModelRunner(
                 else None,
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
+            )
+        if _PROFILE_STEPS:
+            _prof["output_construction_ms"] = (time.perf_counter() - _t0) * 1000
+            _prof["step_total"] = (time.perf_counter() - self._t_exec_start) * 1000
+            logger.info(
+                "[PROFILE] step_total=%.2fms | %s",
+                _prof["step_total"],
+                " | ".join(
+                    f"{k}={v:.2f}" for k, v in _prof.items() if k != "step_total"
+                ),
             )
 
         if not self.use_async_scheduling:
