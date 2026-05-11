@@ -3834,14 +3834,20 @@ class GPUModelRunner(
             assert kv_connector_metadata is not None
             get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
+        if _PROFILE_STEPS:
+            _prof["preamble_ms"] = (time.perf_counter() - _t0) * 1000
+            _t0 = time.perf_counter()
+
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         with (
             record_function_or_nullcontext("gpu_model_runner: preprocess"),
             self.synchronize_input_prep(),
         ):
-            # Update persistent batch states.
             if _PROFILE_STEPS:
+                _prof["sync_input_prep_ms"] = (time.perf_counter() - _t0) * 1000
                 _t0 = time.perf_counter()
+
+            # Update persistent batch states.
             deferred_state_corrections_fn = self._update_states(scheduler_output)
             if _PROFILE_STEPS:
                 _prof["update_states_ms"] = (time.perf_counter() - _t0) * 1000
@@ -3888,6 +3894,7 @@ class GPUModelRunner(
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
 
             if _PROFILE_STEPS:
+                _prof["batch_setup_ms"] = (time.perf_counter() - _t0) * 1000
                 _t0 = time.perf_counter()
             logits_indices, spec_decode_metadata = self._prepare_inputs(
                 scheduler_output,
@@ -4004,6 +4011,7 @@ class GPUModelRunner(
             )
 
             if _PROFILE_STEPS:
+                _prof["batch_padding_ms"] = (time.perf_counter() - _t0) * 1000
                 _t0 = time.perf_counter()
             attn_metadata, spec_decode_common_attn_metadata = (
                 self._build_attention_metadata(
@@ -4036,6 +4044,11 @@ class GPUModelRunner(
             )
             if _PROFILE_STEPS:
                 _prof["_preprocess_ms"] = (time.perf_counter() - _t0) * 1000
+                _t0 = time.perf_counter()
+
+        if _PROFILE_STEPS:
+            _prof["sync_exit_ms"] = (time.perf_counter() - _t0) * 1000
+            _t0 = time.perf_counter()
 
         # Set cudagraph mode to none if calc_kv_scales is true.
         # KV scales calculation involves dynamic operations that are incompatible
@@ -4076,6 +4089,7 @@ class GPUModelRunner(
             ) as kv_connector_output,
         ):
             if _PROFILE_STEPS:
+                _prof["forward_setup_ms"] = (time.perf_counter() - _t0) * 1000
                 _t0 = time.perf_counter()
             model_output = self._model_forward(
                 input_ids=input_ids,
@@ -4149,6 +4163,7 @@ class GPUModelRunner(
 
         if _PROFILE_STEPS:
             _prof["postprocess_ms"] = (time.perf_counter() - _t0) * 1000
+            _t0 = time.perf_counter()
 
         self.execute_model_state = ExecuteModelState(
             scheduler_output,
@@ -4168,6 +4183,9 @@ class GPUModelRunner(
         # previous model forward without breaking async scheduling.
         if deferred_state_corrections_fn:
             deferred_state_corrections_fn()
+
+        if _PROFILE_STEPS:
+            _prof["store_state_ms"] = (time.perf_counter() - _t0) * 1000
 
         return None
 
@@ -4232,9 +4250,6 @@ class GPUModelRunner(
         )
         if self.use_async_scheduling:
             pp = get_pp_group()
-            # For torchrun external_launcher PP mode with broadcast_pp_output=True,
-            # PP outputs have been broadcasted to all ranks at logits computation.
-            # Therefore, here is no need to send sampled token ids again in this case.
             if not self.broadcast_pp_output and pp.world_size > 1 and pp.is_last_rank:
                 self._pp_broadcast_prev_sampled_token_ids(
                     sampler_output.sampled_token_ids
@@ -4244,6 +4259,10 @@ class GPUModelRunner(
         self._draft_token_req_ids = None
         self.valid_sampled_token_count_gpu = None
         self.input_batch.prev_sampled_token_ids = None
+
+        if _PROFILE_STEPS:
+            _prof["post_sample_ms"] = (time.perf_counter() - _t0) * 1000
+            _t0 = time.perf_counter()
 
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
@@ -4359,24 +4378,19 @@ class GPUModelRunner(
             _t0 = time.perf_counter()
 
         if propose_drafts_after_bookkeeping:
-            # ngram and other speculative decoding methods use the sampled
-            # tokens on the CPU, so they are run after bookkeeping.
             propose_draft_token_ids(valid_sampled_token_ids)
 
-        # Finalize KV connector (wait_for_save + clear metadata) after
-        # draft model runs. Deferred from target model forward to allow
-        # draft model to also save its KV cache.
         if spec_config is not None:
             self.finalize_kv_connector()
 
         with record_function_or_nullcontext("gpu_model_runner: eplb"):
             self.eplb_step()
 
-        # self.kv_connector_output may be modified during drafting
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
 
         if _PROFILE_STEPS:
+            _prof["post_bookkeep_ms"] = (time.perf_counter() - _t0) * 1000
             _t0 = time.perf_counter()
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             if self.routed_experts_initialized:
