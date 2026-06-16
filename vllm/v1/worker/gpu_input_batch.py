@@ -9,6 +9,7 @@ import numpy as np
 import torch
 
 from vllm.config.reasoning import ReasoningConfig
+from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
@@ -28,6 +29,8 @@ from vllm.v1.sample.thinking_budget_state import (
 )
 from vllm.v1.utils import copy_slice
 from vllm.v1.worker.block_table import MultiGroupBlockTable
+
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -354,6 +357,25 @@ class InputBatch:
         num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
             request.prompt_token_ids, request.prompt_embeds
         )
+
+        # DEBUG TRACING: Log prompt length and validate against max_model_len
+        # This catches requests that bypassed API-layer validation
+        logger.info(
+            f"[DEBUG] InputBatch.add_request: req_id={req_id}, "
+            f"num_prompt_tokens={num_prompt_tokens}, "
+            f"max_model_len={self.max_model_len}, "
+            f"num_output_tokens={len(request.output_token_ids)}"
+        )
+
+        if num_prompt_tokens > self.max_model_len:
+            error_msg = (
+                f"Request {req_id}: prompt length ({num_prompt_tokens}) exceeds "
+                f"max_model_len ({self.max_model_len}). This request should have been "
+                f"rejected at the API layer. This indicates a validation gap."
+            )
+            logger.error(f"[DEBUG] {error_msg}")
+            raise ValueError(error_msg)
+
         self.num_prompt_tokens[req_index] = num_prompt_tokens
         start_idx = num_prompt_tokens
         end_idx = start_idx + len(request.output_token_ids)
